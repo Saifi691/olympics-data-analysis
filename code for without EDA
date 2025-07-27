@@ -1,0 +1,92 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.ml.feature import VectorAssembler, StringIndexer
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+
+# Initialize Spark Session
+spark = SparkSession.builder.appName("Athlete Event Prediction").getOrCreate()
+
+# Load the dataset
+
+data = spark.read.csv("/content/athlete_events.csv", header=True, inferSchema=True)
+
+# Display the data schema
+data.printSchema()
+
+# --------------------- Data Preprocessing --------------------- #
+# Handle missing values
+data = data.dropna(subset=["Sex", "Age", "Height", "Weight", "Sport", "Event"])
+
+# Encode categorical variables
+sex_indexer = StringIndexer(inputCol="Sex", outputCol="SexIndex")
+sport_indexer = StringIndexer(inputCol="Sport", outputCol="SportIndex")
+data = sex_indexer.fit(data).transform(data)
+data = sport_indexer.fit(data).transform(data)
+
+# Cast numerical columns to float
+data = data.withColumn("Age", col("Age").cast("float"))
+data = data.withColumn("Height", col("Height").cast("float"))
+data = data.withColumn("Weight", col("Weight").cast("float"))
+
+# Check schema to confirm data types
+data.printSchema()
+file_path = "/content/athlete_events.csv"
+# Create feature vector
+feature_cols = ["SexIndex", "Age", "Height", "Weight"]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features", handleInvalid="skip")  # skip rows with invalid values
+data = assembler.transform(data)
+
+# Select features and labels
+data = data.select(col("features"), col("SportIndex").alias("label"))
+
+# Split data into training and test sets
+train_data, test_data = data.randomSplit([0.8, 0.2], seed=42)
+
+# --------------------- Model Training --------------------- #
+# Train a Linear Regression model for Sport prediction
+lr = LinearRegression(featuresCol="features", labelCol="label", maxIter=10)
+model = lr.fit(train_data)
+
+# --------------------- Model Evaluation --------------------- #
+# Make predictions on the test set
+predictions = model.transform(test_data)
+
+# Evaluate the model using RegressionEvaluator
+evaluator = RegressionEvaluator(labelCol="label", predictionCol="prediction", metricName="rmse")
+rmse = evaluator.evaluate(predictions)
+print(f"Model RMSE: {rmse:.2f}")
+
+# --------------------- Interactive Prediction --------------------- #
+print("\nEnter the following details to predict Sport: ")
+sex = input("Enter Sex (Male/Female): ")
+age = float(input("Enter Age: "))
+height = float(input("Enter Height: "))
+weight = float(input("Enter Weight: "))
+
+# Prepare input data
+sex_index = 1.0 if sex.lower() == "female" else 0.0  # Adjust indexing as per StringIndexer
+input_data = spark.createDataFrame([(sex_index, age, height, weight)], feature_cols)
+input_data = assembler.transform(input_data)
+
+# Predict SportIndex for the input data
+predicted_sport = model.transform(input_data)
+predicted_sport.show()
+
+# --------------------- Map Predicted SportIndex to Sport Name --------------------- #
+# Get the SportIndex and convert it back to Sport name
+predicted_sport_index = predicted_sport.select("prediction").collect()[0][0]
+
+# Get original data to map SportIndex back to Sport
+original_data = spark.read.csv(file_path, header=True, inferSchema=True)
+
+# Reverse the StringIndexer for sport (mapping index to sport name)
+sport_indexer_reverse = StringIndexer(inputCol="Sport", outputCol="SportName", handleInvalid="skip")
+sport_indexer_reverse_model = sport_indexer_reverse.fit(original_data)  # Fit the reverse indexer model on the original data
+
+# Map the predicted index to the actual sport name
+predicted_sport_name = sport_indexer_reverse_model.labels[int(predicted_sport_index)]
+
+print(f"\nPredicted Sport: {predicted_sport_name}")
+# Stop the Spark session
+spark.stop()
