@@ -1,0 +1,157 @@
+# ---------------------- IMPORT LIBRARIES ---------------------- #
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+from pyspark.ml.feature import VectorAssembler, StringIndexer, IndexToString
+from pyspark.ml.classification import RandomForestClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator
+
+# ---------------------- INITIALIZE SPARK SESSION ---------------------- #
+spark = SparkSession.builder.appName("OlympicEDA_Model").getOrCreate()
+
+# ---------------------- LOAD DATA ---------------------- #
+file_path = "/content/athlete_events.csv"
+data = spark.read.csv(file_path, header=True, inferSchema=True)
+
+# ---------------------- TAKE A SMALL SAMPLE FOR EDA (20 ROWS) ---------------------- #
+sample_data = data.select("Age", "Height", "Weight", "Sex", "Sport").limit(100).toPandas()
+
+# ---------------------- PRINT SAMPLE DATA ---------------------- #
+print("\nSample Data (20 Rows for EDA):\n", sample_data)
+
+# ---------------------- CHECK MISSING VALUES ---------------------- #
+print("\nMissing Values in Sample Data:\n", sample_data.isnull().sum())
+
+# ---------------------- HISTOGRAMS (AGE, HEIGHT, WEIGHT) ---------------------- #
+plt.figure(figsize=(12, 4))
+sns.histplot(sample_data["Age"], bins=10, kde=True, color="blue")
+plt.title("Age Distribution (Sample of 20)")
+plt.xlabel("Age")
+plt.ylabel("Frequency")
+plt.show()
+
+plt.figure(figsize=(12, 4))
+sns.histplot(sample_data["Height"], bins=10, kde=True, color="green")
+plt.title("Height Distribution (Sample of 20)")
+plt.xlabel("Height (cm)")
+plt.ylabel("Frequency")
+plt.show()
+
+plt.figure(figsize=(12, 4))
+sns.histplot(sample_data["Weight"], bins=10, kde=True, color="red")
+plt.title("Weight Distribution (Sample of 20)")
+plt.xlabel("Weight (kg)")
+plt.ylabel("Frequency")
+plt.show()
+
+# ---------------------- COUNT PLOT FOR GENDER ---------------------- #
+plt.figure(figsize=(6, 4))
+sns.countplot(x="Sex", data=sample_data, palette="coolwarm")
+plt.title("Gender Distribution (Sample of 20)")
+plt.show()
+
+# ---------------------- BOX PLOTS (OUTLIER DETECTION) ---------------------- #
+plt.figure(figsize=(8, 4))
+sns.boxplot(x=sample_data["Age"])
+plt.title("Box Plot for Age (Sample of 20)")
+plt.show()
+
+plt.figure(figsize=(8, 4))
+sns.boxplot(x=sample_data["Height"])
+plt.title("Box Plot for Height (Sample of 20)")
+plt.show()
+
+plt.figure(figsize=(8, 4))
+sns.boxplot(x=sample_data["Weight"])
+plt.title("Box Plot for Weight (Sample of 20)")
+plt.show()
+
+# ---------------------- SCATTER PLOTS (AGE VS WEIGHT, HEIGHT VS WEIGHT) ---------------------- #
+plt.figure(figsize=(8, 5))
+sns.scatterplot(x="Height", y="Weight", hue="Sex", data=sample_data, alpha=0.7)
+plt.title("Height vs Weight (Sample of 20)")
+plt.show()
+
+plt.figure(figsize=(8, 5))
+sns.scatterplot(x="Age", y="Weight", hue="Sex", data=sample_data, alpha=0.7)
+plt.title("Age vs Weight (Sample of 20)")
+plt.show()
+
+# ---------------------- COUNT PLOT FOR SPORTS ---------------------- #
+plt.figure(figsize=(10, 5))
+sns.countplot(y="Sport", data=sample_data, order=sample_data["Sport"].value_counts().index, palette="viridis")
+plt.title("Popular Sports (Sample of 20)")
+plt.xlabel("Count")
+plt.ylabel("Sport")
+plt.show()
+
+# ---------------------- CONTINUE WITH ML TRAINING ON FULL DATA ---------------------- #
+print("\nContinuing with Full Dataset for ML Training...\n")
+
+# Drop missing values in full dataset
+data = data.dropna(subset=["Sex", "Age", "Height", "Weight", "Sport"])
+
+# Encode categorical variables
+sex_indexer = StringIndexer(inputCol="Sex", outputCol="SexIndex")
+sport_indexer = StringIndexer(inputCol="Sport", outputCol="SportIndex")
+
+data = sex_indexer.fit(data).transform(data)
+sport_indexer_model = sport_indexer.fit(data)
+data = sport_indexer_model.transform(data)
+
+# Convert numerical columns to float
+for col_name in ["Age", "Height", "Weight"]:
+    data = data.withColumn(col_name, col(col_name).cast("float"))
+
+# Create feature vector
+feature_cols = ["SexIndex", "Age", "Height", "Weight"]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol="features", handleInvalid="skip")
+data = assembler.transform(data)
+
+# Select features and labels
+data = data.select("features", col("SportIndex").alias("label"))
+
+# Split data into training and test sets
+train_data, test_data = data.randomSplit([0.8, 0.2], seed=42)
+
+
+# ---------------------- MODEL TRAINING (RANDOM FOREST) ---------------------- #
+rf = RandomForestClassifier(featuresCol="features", labelCol="label", numTrees=50, maxBins=100) # Increased maxBins to 100
+model = rf.fit(train_data)
+
+# ---------------------- MODEL EVALUATION ---------------------- #
+predictions = model.transform(test_data)
+
+# Evaluate using accuracy metric
+evaluator = MulticlassClassificationEvaluator(labelCol="label", predictionCol="prediction", metricName="accuracy")
+accuracy = evaluator.evaluate(predictions)
+print(f"Model Accuracy: {accuracy:.2f}")
+
+# ---------------------- INTERACTIVE PREDICTION ---------------------- #
+print("\nEnter the following details to predict Sport: ")
+sex = input("Enter Sex (Male/Female): ")
+age = float(input("Enter Age: "))
+height = float(input("Enter Height: "))
+weight = float(input("Enter Weight: "))
+
+# Prepare input data
+sex_index = 1.0 if sex.lower() == "female" else 0.0
+input_data = spark.createDataFrame([(sex_index, age, height, weight)], feature_cols)
+input_data = assembler.transform(input_data)
+
+# Predict SportIndex for the input data
+predicted_sport = model.transform(input_data)
+
+# Reverse the StringIndexer for sport mapping
+index_to_string = IndexToString(inputCol="prediction", outputCol="SportName", labels=sport_indexer_model.labels)
+predicted_sport = index_to_string.transform(predicted_sport)
+
+# Get predicted sport name
+predicted_sport_name = predicted_sport.select("SportName").collect()[0][0]
+
+print(f"\nPredicted Sport: {predicted_sport_name}")
+
+# Stop Spark session
+spark.stop()
